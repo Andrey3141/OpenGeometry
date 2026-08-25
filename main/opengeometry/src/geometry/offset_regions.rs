@@ -125,33 +125,39 @@ fn forbidden_stadium(a: Pt2, b: Pt2, distance: f64) -> Vec<Pt2> {
     ring // n = u rotated +90°, so this traversal is CW (winding −1)
 }
 
-/// Inset a CLOSED ring inward, one distance per edge (edge i = ring[i] →
-/// ring[i+1], after stripping an optional closing duplicate). The result is
-/// the CLEARANCE-EXACT buildable region: the ring's interior minus, per edge,
-/// every point within that edge's distance of the edge SEGMENT (not just its
-/// line) — resolved as a positive-winding clip of the ring against per-edge
-/// forbidden stadiums. Corners therefore become circumscribed clearance arcs
-/// where distances differ (no miters, no bevels — both only approximate the
-/// arc, and a bevel would violate the clearance), distant edges are honoured
-/// across notches, and an over-deep inset collapses to nothing instead of
-/// inverting. Returns zero or more disjoint regions (a deep inset can split a
-/// waisted ring into separate lobes), each CW-outer / CCW-holes, canonicalised
-/// — the same output contract as `offset_polyline_regions`. `Ok(vec![])` = the
-/// inset collapsed or the input ring is degenerate; `Err` = malformed
-/// ARGUMENTS (distance count mismatch, negative / non-finite distance).
-pub fn offset_ring_variable(
+/// One interior hole of a ring being inset: its own closed ring plus one
+/// clearance distance per hole edge (edge i = ring[i] → ring[i+1]). The hole
+/// is an excluded region — an easement island, a protected tree pit — so the
+/// inset GROWS the hole by its distances (the buildable region keeps clear of
+/// the hole's edges, exactly as it keeps clear of the outer lot lines).
+pub struct OffsetHole {
+    pub ring: Vec<Vector3>,
+    pub distances: Vec<f64>,
+}
+
+/// Prepare one ring of a variable inset: strip the closing duplicate, check the
+/// per-edge distance count and values, drop zero-length edges together with
+/// their distance slot, and wind the ring the way the positive-winding clip
+/// needs it (`want_ccw` = the base ring, else a subtractive hole). Reversing a
+/// ring turns edge k into traversed-backward edge (m-2-k) mod m, so the
+/// distances are remapped the same way. `Ok(None)` = the ring is geometrically
+/// degenerate (< 3 edges, zero area, self-intersecting); `Err` = malformed
+/// ARGUMENTS.
+fn prepare_inset_ring(
     ring: &[Vector3],
     distances: &[f64],
+    want_ccw: bool,
+    label: &str,
     eps: f64,
-) -> Result<Vec<OffsetRegion>, String> {
-    let base_y = ring.first().map(|v| v.y).unwrap_or(0.0);
+) -> Result<Option<(Vec<Pt2>, Vec<f64>)>, String> {
     let raw: Vec<Pt2> = ring.iter().map(xz).collect();
     let (pts, _) = resolve_closed(&raw, true, eps);
     let n = pts.len();
 
     if distances.len() != n {
         return Err(format!(
-            "Expected one distance per ring edge (edge i = ring[i] -> ring[i+1]): the ring has {} edges but {} distances were given",
+            "Expected one distance per {} edge (edge i = ring[i] -> ring[i+1]): the ring has {} edges but {} distances were given",
+            label,
             n,
             distances.len()
         ));
@@ -159,8 +165,8 @@ pub fn offset_ring_variable(
     for (i, d) in distances.iter().enumerate() {
         if !d.is_finite() || *d < 0.0 {
             return Err(format!(
-                "distances[{}] = {} is invalid: every per-edge distance must be a finite value >= 0",
-                i, d
+                "{} distances[{}] = {} is invalid: every per-edge distance must be a finite value >= 0",
+                label, i, d
             ));
         }
     }
@@ -184,29 +190,87 @@ pub fn offset_ring_variable(
 
     let m = pts2.len();
     if m < 3 || signed_area2(&pts2).abs() <= eps || self_intersects2(&pts2, eps) {
-        return Ok(Vec::new()); // geometrically unbuildable input — empty, not an error
+        return Ok(None);
     }
 
-    // The clip needs the base ring CCW (+1) against CW cutters (−1).
-    if signed_area2(&pts2) < 0.0 {
+    let is_ccw = signed_area2(&pts2) > 0.0;
+    if is_ccw != want_ccw {
         pts2.reverse();
         let old = dist2.clone();
-        // Reversal turns edge k into traversed-backward edge (m-2-k) mod m, so
-        // the per-edge distances are remapped the same way.
         for (k, slot) in dist2.iter_mut().enumerate() {
             *slot = old[(2 * m - 2 - k) % m];
         }
     }
+    Ok(Some((pts2, dist2)))
+}
 
-    if dist2.iter().all(|d| *d == 0.0) {
+/// Inset a CLOSED ring inward, one distance per edge (edge i = ring[i] →
+/// ring[i+1], after stripping an optional closing duplicate). The result is
+/// the CLEARANCE-EXACT buildable region: the ring's interior minus, per edge,
+/// every point within that edge's distance of the edge SEGMENT (not just its
+/// line) — resolved as a positive-winding clip of the ring against per-edge
+/// forbidden stadiums. Corners therefore become circumscribed clearance arcs
+/// where distances differ (no miters, no bevels — both only approximate the
+/// arc, and a bevel would violate the clearance), distant edges are honoured
+/// across notches, and an over-deep inset collapses to nothing instead of
+/// inverting. `holes` are excluded interior rings (each with its own per-edge
+/// distances): they are subtracted from the region and their clearance zones
+/// grow them outward, so a hole can also split the region or swallow it.
+/// Returns zero or more disjoint regions (a deep inset can split a
+/// waisted ring into separate lobes), each CW-outer / CCW-holes, canonicalised
+/// — the same output contract as `offset_polyline_regions`. `Ok(vec![])` = the
+/// inset collapsed or the outer ring is degenerate; `Err` = malformed
+/// ARGUMENTS (distance count mismatch, negative / non-finite distance, or a
+/// degenerate hole ring — a hole is an explicit argument, so a broken one is a
+/// caller bug rather than "nothing buildable").
+pub fn offset_ring_variable(
+    ring: &[Vector3],
+    distances: &[f64],
+    holes: &[OffsetHole],
+    eps: f64,
+) -> Result<Vec<OffsetRegion>, String> {
+    let base_y = ring.first().map(|v| v.y).unwrap_or(0.0);
+
+    // The clip needs the base ring CCW (+1) against CW cutters (−1).
+    let Some((pts2, dist2)) = prepare_inset_ring(ring, distances, true, "ring", eps)? else {
+        return Ok(Vec::new()); // geometrically unbuildable input — empty, not an error
+    };
+    let m = pts2.len();
+
+    let mut hole_rings: Vec<(Vec<Pt2>, Vec<f64>)> = Vec::with_capacity(holes.len());
+    for (h, hole) in holes.iter().enumerate() {
+        let label = format!("holes[{}]", h);
+        match prepare_inset_ring(&hole.ring, &hole.distances, false, &label, eps)? {
+            Some(prepared) => hole_rings.push(prepared),
+            None => {
+                return Err(format!(
+                    "{} is degenerate: a hole needs at least 3 non-collinear, non-self-intersecting points",
+                    label
+                ))
+            }
+        }
+    }
+
+    let no_inset = dist2.iter().all(|d| *d == 0.0)
+        && hole_rings.iter().all(|(_, d)| d.iter().all(|d| *d == 0.0));
+    if no_inset && hole_rings.is_empty() {
         return Ok(vec![finalize_region(&pts2, &[], base_y)]); // no-op inset
     }
 
-    let mut polys: Vec<Vec<Pt2>> = Vec::with_capacity(1 + m);
+    let mut polys: Vec<Vec<Pt2>> = Vec::with_capacity(1 + m + hole_rings.len() * 8);
     polys.push(pts2.clone());
     for i in 0..m {
         if dist2[i] > 0.0 {
             polys.push(forbidden_stadium(pts2[i], pts2[(i + 1) % m], dist2[i]));
+        }
+    }
+    for (hole, hole_dist) in &hole_rings {
+        polys.push(hole.clone()); // CW → subtracts the hole itself
+        let k = hole.len();
+        for i in 0..k {
+            if hole_dist[i] > 0.0 {
+                polys.push(forbidden_stadium(hole[i], hole[(i + 1) % k], hole_dist[i]));
+            }
         }
     }
 
@@ -378,31 +442,60 @@ pub fn offset_polyline_group_regions_wasm(
     OGOffsetRegionsResult::from_regions(regions).map_err(|error| JsValue::from_str(&error))
 }
 
+/// One hole of a variable inset, as received over the JS boundary.
+#[derive(serde::Deserialize)]
+struct OffsetHoleJson {
+    ring: Vec<f64>,
+    distances: Vec<f64>,
+}
+
 /// Wasm entry point: inset a CLOSED ring inward with one distance per edge
-/// (edge i = ring[i] → ring[i+1]). `ring_flat` is `[x0,y0,z0, …]`. Returns
-/// CW-outer / CCW-hole regions, canonicalised; possibly several when a deep
-/// inset splits the ring, and empty (does NOT throw) when the inset collapses
-/// or the input ring is degenerate. THROWS on malformed arguments: a distance
-/// count that does not match the edge count, or a negative / non-finite
-/// distance. Corners where distances differ are circumscribed clearance arcs
-/// (conservative), so no output point is ever closer to edge i than
-/// `distances[i]` — there is no miter-limit knob because there are no miters.
+/// (edge i = ring[i] → ring[i+1]). `ring_flat` is `[x0,y0,z0, …]`;
+/// `holes_json` is `[{ring:[x,y,z,…], distances:[…]}, …]` (`"[]"` = none) —
+/// excluded interior rings, each grown outward by its own per-edge distances.
+/// Returns CW-outer / CCW-hole regions, canonicalised; possibly several when a
+/// deep inset (or a hole) splits the ring, and empty (does NOT throw) when the
+/// inset collapses or the outer ring is degenerate. THROWS on malformed
+/// arguments: a distance count that does not match an edge count, a negative /
+/// non-finite distance, a degenerate hole, or unparsable `holes_json`. Corners
+/// where distances differ are circumscribed clearance arcs (conservative), so
+/// no output point is ever closer to an edge than that edge's distance —
+/// there is no miter-limit knob because there are no miters.
 #[wasm_bindgen(js_name = offsetRingVariable)]
 pub fn offset_ring_variable_wasm(
     ring_flat: Vec<f64>,
     distances: Vec<f64>,
+    holes_json: String,
 ) -> Result<OGOffsetRegionsResult, JsValue> {
     if ring_flat.len() % 3 != 0 {
         return Err(JsValue::from_str(
             "Ring must be a flat [x,y,z,…] array whose length is a multiple of 3",
         ));
     }
-    let ring: Vec<Vector3> = ring_flat
-        .chunks_exact(3)
-        .map(|c| Vector3::new(c[0], c[1], c[2]))
-        .collect();
+    let to_vectors = |flat: &[f64]| -> Vec<Vector3> {
+        flat.chunks_exact(3)
+            .map(|c| Vector3::new(c[0], c[1], c[2]))
+            .collect()
+    };
+    let ring = to_vectors(&ring_flat);
 
-    let regions = offset_ring_variable(&ring, &distances, DEFAULT_EPS)
+    let parsed: Vec<OffsetHoleJson> = serde_json::from_str(&holes_json)
+        .map_err(|error| JsValue::from_str(&format!("Invalid holes JSON payload: {}", error)))?;
+    let mut holes: Vec<OffsetHole> = Vec::with_capacity(parsed.len());
+    for (h, hole) in parsed.into_iter().enumerate() {
+        if hole.ring.len() % 3 != 0 {
+            return Err(JsValue::from_str(&format!(
+                "holes[{}].ring must be a flat [x,y,z,…] array whose length is a multiple of 3",
+                h
+            )));
+        }
+        holes.push(OffsetHole {
+            ring: to_vectors(&hole.ring),
+            distances: hole.distances,
+        });
+    }
+
+    let regions = offset_ring_variable(&ring, &distances, &holes, DEFAULT_EPS)
         .map_err(|error| JsValue::from_str(&error))?;
     OGOffsetRegionsResult::from_regions(regions).map_err(|error| JsValue::from_str(&error))
 }
@@ -716,7 +809,7 @@ mod tests {
     // ── offset_ring_variable ─────────────────────────────────────────────────
 
     fn variable(ring: &[Vector3], distances: &[f64]) -> Result<Vec<OffsetRegion>, String> {
-        offset_ring_variable(ring, distances, DEFAULT_EPS)
+        offset_ring_variable(ring, distances, &[], DEFAULT_EPS)
     }
 
     fn ring2(region: &OffsetRegion) -> Vec<Pt2> {
@@ -934,7 +1027,7 @@ mod tests {
         ];
         for (ring, distances) in cases {
             let raw: Vec<Pt2> = ring.iter().map(|v| Pt2::new(v.x, v.z)).collect();
-            let regions = offset_ring_variable(&ring, &distances, DEFAULT_EPS).expect("valid");
+            let regions = offset_ring_variable(&ring, &distances, &[], DEFAULT_EPS).expect("valid");
             assert!(!regions.is_empty(), "inset builds");
             for region in &regions {
                 for v in &region.0 {
@@ -1099,5 +1192,90 @@ mod tests {
                 assert_eq!(h1.len(), h2.len());
             }
         }
+    }
+
+    /// A centred hole with its own clearance: the outer ring shrinks inward, the
+    /// hole GROWS outward, and the buildable region is the ring between them.
+    #[test]
+    fn variable_inset_grows_holes_by_their_clearance() {
+        let ring = vec![pt(0.0, 0.0), pt(20.0, 0.0), pt(20.0, 20.0), pt(0.0, 20.0)];
+        let hole = OffsetHole {
+            ring: vec![pt(8.0, 8.0), pt(12.0, 8.0), pt(12.0, 12.0), pt(8.0, 12.0)],
+            distances: vec![1.0; 4],
+        };
+        let regions = offset_ring_variable(&ring, &[1.0; 4], &[hole], DEFAULT_EPS).expect("valid");
+        let (outer, holes) = single(regions);
+        for (x, z) in [(1.0, 1.0), (19.0, 1.0), (19.0, 19.0), (1.0, 19.0)] {
+            assert!(
+                has_vertex(&outer, x, z),
+                "outer corner ({}, {}) inset by 1",
+                x,
+                z
+            );
+        }
+        assert_eq!(holes.len(), 1, "the hole survives as one interior void");
+        let grown: Vec<Pt2> = holes[0].iter().map(|v| Pt2::new(v.x, v.z)).collect();
+        let hole_edges = [
+            (Pt2::new(8.0, 8.0), Pt2::new(12.0, 8.0)),
+            (Pt2::new(12.0, 8.0), Pt2::new(12.0, 12.0)),
+            (Pt2::new(12.0, 12.0), Pt2::new(8.0, 12.0)),
+            (Pt2::new(8.0, 12.0), Pt2::new(8.0, 8.0)),
+        ];
+        for p in &grown {
+            assert!(
+                p.x >= 7.0 - 1e-6 && p.x <= 13.0 + 1e-6 && p.z >= 7.0 - 1e-6 && p.z <= 13.0 + 1e-6
+            );
+            let nearest = hole_edges
+                .iter()
+                .map(|(a, b)| dist_to_segment(*p, *a, *b))
+                .fold(f64::INFINITY, f64::min);
+            assert!(
+                nearest >= 1.0 - 1e-6,
+                "hole vertex ({}, {}) is only {} from the hole",
+                p.x,
+                p.z,
+                nearest
+            );
+        }
+        // The hole's clearance zone reaches (7, 10): inside the grown hole, not buildable.
+        assert!(
+            point_in_ring2(Pt2::new(7.2, 10.0), &grown),
+            "clearance around the hole is void"
+        );
+    }
+
+    /// A hole whose clearance reaches both lot lines splits the region into two lobes.
+    #[test]
+    fn variable_inset_hole_clearance_splits_region() {
+        let ring = vec![pt(0.0, 0.0), pt(20.0, 0.0), pt(20.0, 10.0), pt(0.0, 10.0)];
+        let hole = OffsetHole {
+            ring: vec![pt(9.0, 2.0), pt(11.0, 2.0), pt(11.0, 8.0), pt(9.0, 8.0)],
+            distances: vec![3.0; 4],
+        };
+        let regions = offset_ring_variable(&ring, &[0.0; 4], &[hole], DEFAULT_EPS).expect("valid");
+        assert_eq!(regions.len(), 2, "the grown hole cuts the lot in two");
+        let mut left = 0;
+        let mut right = 0;
+        for (outer, holes) in &regions {
+            assert!(holes.is_empty(), "each lobe is solid");
+            if outer.iter().all(|v| v.x <= 9.0 + 1e-6) {
+                left += 1;
+            }
+            if outer.iter().all(|v| v.x >= 11.0 - 1e-6) {
+                right += 1;
+            }
+        }
+        assert_eq!((left, right), (1, 1), "one lobe each side of the hole");
+    }
+
+    /// A degenerate hole is a caller bug, not "nothing buildable".
+    #[test]
+    fn variable_inset_rejects_degenerate_hole() {
+        let ring = vec![pt(0.0, 0.0), pt(20.0, 0.0), pt(20.0, 20.0), pt(0.0, 20.0)];
+        let hole = OffsetHole {
+            ring: vec![pt(5.0, 5.0), pt(6.0, 5.0), pt(7.0, 5.0)],
+            distances: vec![1.0; 3],
+        };
+        assert!(offset_ring_variable(&ring, &[1.0; 4], &[hole], DEFAULT_EPS).is_err());
     }
 }

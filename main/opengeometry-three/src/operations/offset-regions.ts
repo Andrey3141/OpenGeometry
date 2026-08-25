@@ -60,7 +60,16 @@ export function offsetPolylineRegions(
 type KernelOffsetRingVariable = (
   ringFlat: Float64Array,
   distances: Float64Array,
+  holesJson: string,
 ) => KernelOffsetRegionsResult;
+
+/** An excluded interior ring of a variable inset (an easement island, a
+ *  protected tree pit): its closed ring `[x,y,z, …]` plus one clearance
+ *  distance per hole edge. The inset GROWS the hole by its distances. */
+export interface OffsetHole {
+  ring: number[] | Float64Array;
+  distances: number[] | Float64Array;
+}
 
 /**
  * Inset a CLOSED ring inward with one distance per edge (edge i =
@@ -73,20 +82,27 @@ type KernelOffsetRingVariable = (
  * `miterLimit` parameter, deliberately: miters and bevels only approximate the
  * clearance arc, and a bevel would claim points inside the required distance.
  *
+ * `holes` are excluded interior rings, each grown outward by its own per-edge
+ * distances — the region keeps clear of a hole's edges exactly as it keeps
+ * clear of the lot lines, so a hole can split the region or swallow it.
+ *
  * Returns CW-outer / CCW-hole regions (canonical start vertex), possibly
- * SEVERAL when a deep inset splits a waisted ring into disjoint lobes, and an
- * EMPTY array when the inset collapses or the input ring is degenerate
- * (< 3 unique points, zero area, self-intersecting). THROWS on malformed
- * arguments: a distance count that does not match the edge count, or a
- * negative / non-finite distance — those are caller bugs, not geometry.
+ * SEVERAL when a deep inset (or a hole) splits a waisted ring into disjoint
+ * lobes, and an EMPTY array when the inset collapses or the outer ring is
+ * degenerate (< 3 unique points, zero area, self-intersecting). THROWS on
+ * malformed arguments: a distance count that does not match an edge count, a
+ * negative / non-finite distance, or a degenerate hole — those are caller
+ * bugs, not geometry.
  *
  * @param ring closed ring points as `[x,y,z, …]` (Y is carried through).
  * @param distances inward inset distance per edge, metres, each >= 0
  *                  (0 = the edge stays in place, e.g. lot-line construction).
+ * @param holes excluded interior rings with their own per-edge distances.
  */
 export function offsetRingVariable(
   ring: number[] | Float64Array,
   distances: number[] | Float64Array,
+  holes: OffsetHole[] = [],
 ): OffsetRegion[] {
   const buildExport = (OGKernel as Record<string, unknown>).offsetRingVariable;
   if (typeof buildExport !== "function") {
@@ -97,7 +113,10 @@ export function offsetRingVariable(
   const flatRing = ring instanceof Float64Array ? ring : new Float64Array(ring);
   const flatDistances =
     distances instanceof Float64Array ? distances : new Float64Array(distances);
-  const result = (buildExport as KernelOffsetRingVariable)(flatRing, flatDistances);
+  const holesJson = JSON.stringify(
+    holes.map((hole) => ({ ring: Array.from(hole.ring), distances: Array.from(hole.distances) })),
+  );
+  const result = (buildExport as KernelOffsetRingVariable)(flatRing, flatDistances, holesJson);
   return JSON.parse(result.regionsSerialized);
 }
 
